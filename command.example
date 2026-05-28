@@ -1,0 +1,1 @@
+uv run cd_metadata.py --url "" --dir "" --write --format

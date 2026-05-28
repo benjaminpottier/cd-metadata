@@ -1,0 +1,12 @@
+[project]
+name = "cd-metadata"
+version = "0.1.0"
+description = "Generate ripped-CD metadata from a webpage URL using a local LM Studio model."
+requires-python = ">=3.10"
+dependencies = [
+    "lmstudio>=1.0",
+    "pydantic>=2.0",
+    "mutagen>=1.47",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+]
