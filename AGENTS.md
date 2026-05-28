@@ -19,11 +19,11 @@ review) and the model does the extraction.
 - `cd_metadata.py` — the whole tool. One file, no package.
 - `pyproject.toml` — dependencies, managed by `uv`.
 - `uv.lock` — pinned lockfile; commit changes when deps move.
+- **Use `uv` for everything**: dependency management, running, testing. Don't forget it's required.
 - `command.example` — example invocation.
 - `.venv/` — created by `uv sync`. Do not commit.
 
-There is intentionally no `src/` layout, no tests directory, no CI. Don't add
-those unless explicitly asked.
+There is intentionally no `src/` layout, CI. Tests are present and use `pytest`.
 
 ## Running it
 
@@ -81,5 +81,4 @@ on whatever is currently loaded.
 - Don't introduce a config file. CLI flags are the interface.
 - Don't add network retry/backoff logic. A single `requests.get` with a
   30s timeout is intentional — the user re-runs on failure.
-- Don't add tests scaffolding (`pytest`, `tox`, etc.) unless asked.
 - Don't switch package manager away from `uv`.
