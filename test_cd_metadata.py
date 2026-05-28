@@ -1,0 +1,1093 @@
+"""Tests for cd_metadata.py — aims for 100% line and branch coverage.
+
+Externals (requests, lmstudio, mutagen) are mocked so tests run hermetically.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+import cd_metadata as cdm
+from cd_metadata import (
+    AlbumMetadata,
+    Track,
+    build_image_user_message,
+    build_user_message,
+    clean_metadata,
+    fetch_discogs,
+    fetch_page_text,
+    load_local_tracks,
+    main,
+    query_lmstudio,
+    query_lmstudio_image,
+    rename_release,
+    sanitize,
+    strip_disambiguator,
+    write_tags,
+)
+
+
+# ---------- helpers ----------
+
+def make_meta(tracks=None, **kw):
+    defaults = {
+        "album": "Some Album",
+        "album_artist": "Some Artist",
+        "tracks": tracks if tracks is not None else [
+            Track(track_number=1, title="One"),
+            Track(track_number=2, title="Two"),
+        ],
+    }
+    defaults.update(kw)
+    return AlbumMetadata(**defaults)
+
+
+def touch(path: Path, content: bytes = b"") -> Path:
+    path.write_bytes(content)
+    return path
+
+
+class FakeResponse:
+    def __init__(self, *, text="", json_data=None, status=200):
+        self.text = text
+        self._json = json_data
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._json
+
+
+class FakeAudio:
+    """Dict-like stand-in for mutagen.File(..., easy=True)."""
+
+    def __init__(self):
+        self.data: dict[str, str] = {}
+        self.saved = False
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def save(self):
+        self.saved = True
+
+
+# ---------- strip_disambiguator / clean_metadata ----------
+
+class TestStripDisambiguator:
+    def test_strips_album_suffix(self):
+        assert strip_disambiguator("Discovery (album)") == "Discovery"
+
+    def test_strips_case_insensitive(self):
+        assert strip_disambiguator("Foo (ALBUM)") == "Foo"
+
+    def test_preserves_legit_parenthetical(self):
+        # Not in WIKI_DISAMBIGUATORS — must survive.
+        title = "Smells Like Teen Spirit (Single Edit)"
+        assert strip_disambiguator(title) == title
+
+    def test_no_parenthetical(self):
+        assert strip_disambiguator("Plain Title") == "Plain Title"
+
+
+def test_clean_metadata_strips_album_and_tracks():
+    meta = AlbumMetadata(
+        album="Discovery (album)",
+        album_artist="Daft Punk",
+        tracks=[
+            Track(track_number=1, title="One More Time (song)"),
+            Track(track_number=2, title="Aerodynamic"),
+        ],
+    )
+    cleaned = clean_metadata(meta)
+    assert cleaned.album == "Discovery"
+    assert cleaned.tracks[0].title == "One More Time"
+    assert cleaned.tracks[1].title == "Aerodynamic"
+
+
+# ---------- sanitize ----------
+
+class TestSanitize:
+    def test_replaces_invalid_chars(self):
+        assert sanitize("foo/bar:baz") == "foo - bar - baz"
+
+    def test_strips_trailing_dots_spaces(self):
+        assert sanitize("Hello.  ") == "Hello"
+
+    def test_empty_after_strip_returns_untitled(self):
+        assert sanitize("...") == "Untitled"
+
+    def test_passthrough(self):
+        assert sanitize("Normal Name") == "Normal Name"
+
+
+# ---------- build_user_message ----------
+
+class TestBuildUserMessage:
+    def test_simple(self):
+        msg = build_user_message(
+            "http://x",
+            "page body",
+            [{"position": 1, "filename": "01.flac", "duration_seconds": 30.5}],
+        )
+        assert "http://x" in msg
+        assert "01.flac" in msg
+        assert "30.5" in msg
+        assert "1 track(s)" in msg
+        assert "page body" in msg
+        assert "truncated" not in msg
+
+    def test_truncation(self):
+        long_page = "Z" * (cdm.PAGE_CHAR_BUDGET + 100)
+        msg = build_user_message("http://example", long_page, [])
+        assert "100 more chars truncated" in msg
+        # Page-body portion is clipped to exactly PAGE_CHAR_BUDGET Z's.
+        assert msg.count("Z") == cdm.PAGE_CHAR_BUDGET
+
+
+# ---------- load_local_tracks ----------
+
+def test_load_local_tracks_empty_dir(tmp_path):
+    with pytest.raises(SystemExit):
+        load_local_tracks(tmp_path)
+
+
+def test_load_local_tracks_ignores_non_audio(tmp_path):
+    touch(tmp_path / "cover.jpg")
+    with pytest.raises(SystemExit):
+        load_local_tracks(tmp_path)
+
+
+def test_load_local_tracks_with_durations(tmp_path, monkeypatch):
+    touch(tmp_path / "02.flac")
+    touch(tmp_path / "01.flac")
+
+    def fake_file(p):
+        m = MagicMock()
+        m.info.length = 123.456
+        return m
+
+    monkeypatch.setattr(cdm, "mutagen", MagicMock(File=fake_file))
+    rows = load_local_tracks(tmp_path)
+    assert [r["filename"] for r in rows] == ["01.flac", "02.flac"]
+    assert all(r["duration_seconds"] == 123.46 for r in rows)
+    assert [r["position"] for r in rows] == [1, 2]
+
+
+def test_load_local_tracks_handles_none_mutagen(tmp_path, monkeypatch):
+    touch(tmp_path / "track.mp3")
+    monkeypatch.setattr(cdm, "mutagen", MagicMock(File=lambda p: None))
+    rows = load_local_tracks(tmp_path)
+    assert rows[0]["duration_seconds"] is None
+
+
+def test_load_local_tracks_handles_no_info(tmp_path, monkeypatch):
+    touch(tmp_path / "track.mp3")
+    m = MagicMock()
+    m.info = None
+    monkeypatch.setattr(cdm, "mutagen", MagicMock(File=lambda p: m))
+    rows = load_local_tracks(tmp_path)
+    assert rows[0]["duration_seconds"] is None
+
+
+# ---------- fetch_discogs ----------
+
+class TestFetchDiscogs:
+    def test_releases(self, monkeypatch):
+        captured = {}
+
+        def fake_get(url, timeout, headers):
+            captured["url"] = url
+            captured["headers"] = headers
+            return FakeResponse(json_data={
+                "title": "T", "year": 2001, "x_drop_me": 1, "labels": [],
+            })
+
+        monkeypatch.setattr(cdm.requests, "get", fake_get)
+        out = fetch_discogs("release", "42")
+        assert "releases/42" in out
+        assert "x_drop_me" not in out
+        assert "title" in out
+        assert captured["url"].endswith("/releases/42")
+        assert captured["headers"]["User-Agent"] == cdm.USER_AGENT
+
+    def test_masters_via_master(self, monkeypatch):
+        monkeypatch.setattr(
+            cdm.requests, "get",
+            lambda *a, **k: FakeResponse(json_data={"title": "M"}),
+        )
+        out = fetch_discogs("master", "9")
+        assert "masters/9" in out
+
+    def test_masters_via_m_uppercase(self, monkeypatch):
+        monkeypatch.setattr(
+            cdm.requests, "get",
+            lambda *a, **k: FakeResponse(json_data={"title": "M"}),
+        )
+        out = fetch_discogs("M", "7")
+        assert "masters/7" in out
+
+
+# ---------- fetch_page_text ----------
+
+class TestFetchPageText:
+    def test_discogs_url_dispatches(self, monkeypatch):
+        monkeypatch.setattr(
+            cdm, "fetch_discogs",
+            lambda kind, ident: f"DISCOGS:{kind}:{ident}",
+        )
+        out = fetch_page_text("https://www.discogs.com/release/12345")
+        assert out == "DISCOGS:release:12345"
+
+    def test_html_with_ld_json(self, monkeypatch):
+        html = (
+            '<html><head>'
+            '<script type="application/ld+json">{"@type":"MusicAlbum"}</script>'
+            '<script type="application/ld+json"></script>'
+            '</head>'
+            '<body><nav>NAVTEXT</nav><p>BodyTitle</p>'
+            '<script>var x=1</script></body></html>'
+        )
+        monkeypatch.setattr(
+            cdm.requests, "get",
+            lambda *a, **k: FakeResponse(text=html),
+        )
+        out = fetch_page_text("https://example.com/album")
+        assert "JSON-LD" in out
+        assert "MusicAlbum" in out
+        assert "PAGE TEXT" in out
+        assert "BodyTitle" in out
+        assert "var x=1" not in out  # script tag stripped
+        assert "NAVTEXT" not in out.split("PAGE TEXT", 1)[1]
+
+    def test_html_without_ld_json(self, monkeypatch):
+        html = "<html><body><p>Just body text</p></body></html>"
+        monkeypatch.setattr(
+            cdm.requests, "get",
+            lambda *a, **k: FakeResponse(text=html),
+        )
+        out = fetch_page_text("https://example.com/album")
+        assert "JSON-LD" not in out
+        assert "Just body text" in out
+
+
+# ---------- query_lmstudio ----------
+
+class TestQueryLmstudio:
+    @staticmethod
+    def _setup(monkeypatch, parsed):
+        fake_lms = MagicMock()
+        client = fake_lms.Client.return_value.__enter__.return_value
+        fake_lms.Client.return_value.__exit__.return_value = False
+        model = client.llm.model.return_value
+        model.respond.return_value.parsed = parsed
+        monkeypatch.setattr(cdm, "lms", fake_lms)
+        return fake_lms, client, model
+
+    def test_with_model_name_and_pydantic_parsed(self, monkeypatch):
+        meta = make_meta()
+        _, client, model = self._setup(monkeypatch, meta)
+        out = query_lmstudio("my-model", "http://x", "page", [])
+        assert isinstance(out, AlbumMetadata)
+        client.llm.model.assert_called_once_with("my-model")
+        model.respond.assert_called_once()
+
+    def test_without_model_name(self, monkeypatch):
+        meta = make_meta()
+        _, client, _ = self._setup(monkeypatch, meta)
+        query_lmstudio(None, "http://x", "page", [])
+        client.llm.model.assert_called_once_with()
+
+    def test_dict_parsed_uses_model_validate(self, monkeypatch):
+        parsed_dict = {
+            "album": "A (album)",
+            "album_artist": "B",
+            "tracks": [{"track_number": 1, "title": "T (song)"}],
+        }
+        self._setup(monkeypatch, parsed_dict)
+        out = query_lmstudio(None, "http://x", "page", [])
+        # clean_metadata strips disambiguators.
+        assert out.album == "A"
+        assert out.tracks[0].title == "T"
+
+
+# ---------- build_image_user_message ----------
+
+class TestBuildImageUserMessage:
+    def test_includes_track_count_and_listing(self):
+        msg = build_image_user_message([
+            {"position": 1, "filename": "01.flac", "duration_seconds": 30.5},
+            {"position": 2, "filename": "02.flac", "duration_seconds": 45.0},
+        ])
+        assert "2 track(s)" in msg
+        assert "01.flac" in msg
+        assert "02.flac" in msg
+        assert "attached image" in msg
+        # No URL or page text — those are URL-mode concerns.
+        assert "Source URL" not in msg
+        assert "PAGE TEXT" not in msg
+
+
+# ---------- query_lmstudio_image ----------
+
+class TestQueryLmstudioImage:
+    @staticmethod
+    def _setup(monkeypatch, parsed):
+        fake_lms = MagicMock()
+        client = fake_lms.Client.return_value.__enter__.return_value
+        fake_lms.Client.return_value.__exit__.return_value = False
+        client.prepare_image.return_value = MagicMock(name="FileHandle")
+        model = client.llm.model.return_value
+        model.respond.return_value.parsed = parsed
+        monkeypatch.setattr(cdm, "lms", fake_lms)
+        return fake_lms, client, model
+
+    def test_passes_image_handle_to_chat(self, tmp_path, monkeypatch):
+        img = tmp_path / "back.jpg"
+        img.write_bytes(b"")
+        meta = make_meta()
+        fake_lms, client, _ = self._setup(monkeypatch, meta)
+        out = query_lmstudio_image("my-model", img, [])
+        assert isinstance(out, AlbumMetadata)
+        client.prepare_image.assert_called_once_with(img)
+        client.llm.model.assert_called_once_with("my-model")
+        # Image handle should be plumbed through to add_user_message(images=...).
+        chat = fake_lms.Chat.return_value
+        _, kwargs = chat.add_user_message.call_args
+        assert kwargs["images"] == [client.prepare_image.return_value]
+        # And the chat is built from the image-specific system prompt.
+        fake_lms.Chat.assert_called_once_with(cdm.IMAGE_SYSTEM_PROMPT)
+
+    def test_without_model_name(self, tmp_path, monkeypatch):
+        img = tmp_path / "back.png"
+        img.write_bytes(b"")
+        _, client, _ = self._setup(monkeypatch, make_meta())
+        query_lmstudio_image(None, img, [])
+        client.llm.model.assert_called_once_with()
+
+    def test_dict_parsed_uses_model_validate(self, tmp_path, monkeypatch):
+        img = tmp_path / "back.png"
+        img.write_bytes(b"")
+        parsed_dict = {
+            "album": "A (album)",
+            "album_artist": "B",
+            "tracks": [{"track_number": 1, "title": "T (song)"}],
+        }
+        self._setup(monkeypatch, parsed_dict)
+        out = query_lmstudio_image(None, img, [])
+        assert out.album == "A"
+        assert out.tracks[0].title == "T"
+
+
+# ---------- write_tags ----------
+
+class TestWriteTags:
+    def test_refuses_on_mismatch(self, tmp_path, caplog, monkeypatch):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        touch(tmp_path / "01.flac")
+        meta = make_meta()  # 2 tracks vs 1 file
+        called = []
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda *a, **k: called.append(1)),
+        )
+        write_tags(tmp_path, meta)
+        assert "refusing to write" in caplog.text
+        assert called == []
+
+    def test_happy_path_with_all_optionals(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.INFO, logger="cd_metadata")
+        touch(tmp_path / "01.flac")
+        touch(tmp_path / "02.flac")
+        meta = make_meta(
+            date="1999", genre="Rock",
+            tracks=[
+                Track(track_number=1, title="A", artist="X", composer="C1"),
+                Track(track_number=2, title="B"),
+            ],
+        )
+        objs = {p.name: FakeAudio() for p in tmp_path.iterdir()}
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda path, easy=False: objs[path.name]),
+        )
+        write_tags(tmp_path, meta)
+        assert "Tagged: 01.flac" in caplog.text
+        assert "Tagged: 02.flac" in caplog.text
+        first = objs["01.flac"].data
+        assert first["title"] == "A"
+        assert first["artist"] == "X"
+        assert first["composer"] == "C1"
+        assert first["date"] == "1999"
+        assert first["genre"] == "Rock"
+        assert objs["01.flac"].saved
+        second = objs["02.flac"].data
+        assert second["artist"] == "Some Artist"  # fell back to album_artist
+        assert "composer" not in second
+
+    def test_happy_path_without_optionals(self, tmp_path, monkeypatch):
+        """Cover the False side of `if meta.date`, `if meta.genre`, `if composer`."""
+        touch(tmp_path / "01.flac")
+        meta = make_meta(tracks=[Track(track_number=1, title="Only")])
+        obj = FakeAudio()
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda *a, **k: obj),
+        )
+        write_tags(tmp_path, meta)
+        assert "date" not in obj.data
+        assert "genre" not in obj.data
+        assert "composer" not in obj.data
+
+    def test_skips_unsupported_format(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        touch(tmp_path / "01.flac")
+        meta = make_meta(tracks=[Track(track_number=1, title="A")])
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda *a, **k: None),
+        )
+        write_tags(tmp_path, meta)
+        assert "unsupported tag format" in caplog.text
+
+
+# ---------- rename_release ----------
+
+class TestRenameRelease:
+    def test_refuses_on_mismatch(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "a.flac")  # 1 file
+        meta = make_meta()  # 2 tracks
+        assert rename_release(d, meta) is None
+        assert "refusing to rename" in caplog.text
+
+    def test_happy_path(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "a.flac")
+        touch(d / "b.flac")
+        meta = make_meta(date="2020-01-01")
+        result = rename_release(d, meta)
+        assert result is not None
+        assert result.name == "Some Artist - Some Album (2020) [FLAC]"
+        names = sorted(p.name for p in result.iterdir())
+        assert names == ["01. One.flac", "02. Two.flac"]
+        assert "Renamed dir" in caplog.text
+        assert "Renamed:" in caplog.text
+
+    def test_target_dir_exists_collision(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "a.flac")
+        touch(d / "b.flac")
+        (tmp_path / "Some Artist - Some Album (Unknown) [FLAC]").mkdir()
+        assert rename_release(d, make_meta()) is None
+        assert "target directory already exists" in caplog.text
+
+    def test_audio_dir_already_correct(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger="cd_metadata")
+        d = tmp_path / "Some Artist - Some Album (Unknown) [FLAC]"
+        d.mkdir()
+        touch(d / "01. One.flac")  # already-correct name → continue branch
+        touch(d / "b.flac")
+        meta = make_meta(tracks=[
+            Track(track_number=1, title="One"),
+            Track(track_number=2, title="Two"),
+        ])
+        result = rename_release(d, meta)
+        assert result == d
+        assert "Renamed dir" not in caplog.text  # dir name already matched
+        assert "b.flac -> 02. Two.flac" in caplog.text
+        assert sorted(p.name for p in d.iterdir()) == [
+            "01. One.flac", "02. Two.flac",
+        ]
+
+    def test_per_file_collision(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "aaa.flac")
+        touch(d / "bbb.flac")
+        # Two tracks share track_number+title → both target the same path.
+        meta = make_meta(tracks=[
+            Track(track_number=1, title="Same"),
+            Track(track_number=1, title="Same"),
+        ])
+        rename_release(d, meta)
+        assert "target exists, skipping" in caplog.text
+
+
+# ---------- main ----------
+
+# ---------- color formatter ----------
+
+class TestColorFormatter:
+    def _record(self, level):
+        return logging.LogRecord(
+            "x", level, "x", 0, "hello", None, None,
+        )
+
+    def test_colors_levelname_when_enabled(self):
+        fmt = cdm._ColorFormatter("%(levelname)s: %(message)s", color=True)
+        out = fmt.format(self._record(logging.WARNING))
+        # Yellow escape on, reset after the level name, message uncolored.
+        assert out.startswith("\033[33mWARNING\033[0m: hello")
+
+    def test_info_uses_cyan(self):
+        fmt = cdm._ColorFormatter("%(levelname)s: %(message)s", color=True)
+        out = fmt.format(self._record(logging.INFO))
+        assert out.startswith("\033[36mINFO\033[0m: ")
+
+    def test_no_color_when_disabled(self):
+        fmt = cdm._ColorFormatter("%(levelname)s: %(message)s", color=False)
+        out = fmt.format(self._record(logging.WARNING))
+        assert "\033[" not in out
+        assert out == "WARNING: hello"
+
+    def test_unknown_level_skips_color(self):
+        """Custom level numbers not in the map → no color even when enabled."""
+        fmt = cdm._ColorFormatter("%(levelname)s: %(message)s", color=True)
+        rec = logging.LogRecord("x", 25, "x", 0, "hello", None, None)
+        out = fmt.format(rec)
+        assert "\033[" not in out
+
+
+class _FakeStderr:
+    """Stand-in for sys.stderr with a controllable isatty()."""
+
+    def __init__(self, tty: bool):
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, s):  # pragma: no cover - unused in these tests
+        pass
+
+    def flush(self):  # pragma: no cover - unused in these tests
+        pass
+
+
+def test_configure_logging_attaches_root_handler(monkeypatch):
+    """Cover the root.handlers-empty branch of _configure_logging.
+
+    Pytest's caplog plugin pre-attaches handlers to root, so the branch only
+    fires when we explicitly clear them.
+    """
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    root.handlers.clear()
+    try:
+        monkeypatch.setenv("NO_COLOR", "1")  # decouple from TTY state
+        cdm._configure_logging()
+        assert len(root.handlers) == 1
+        formatter = root.handlers[0].formatter
+        assert isinstance(formatter, cdm._ColorFormatter)
+        assert formatter.color is False
+        assert root.level == logging.INFO
+    finally:
+        # Restore so caplog keeps working for the rest of the suite.
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in saved_handlers:
+            root.addHandler(h)
+        root.setLevel(saved_level)
+
+
+class TestColorEnabled:
+    def test_on_when_tty_and_no_env(self, monkeypatch):
+        monkeypatch.setattr(sys, "stderr", _FakeStderr(True))
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert cdm._color_enabled() is True
+
+    def test_off_when_no_color_env(self, monkeypatch):
+        monkeypatch.setattr(sys, "stderr", _FakeStderr(True))
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert cdm._color_enabled() is False
+
+    def test_off_when_not_tty(self, monkeypatch):
+        monkeypatch.setattr(sys, "stderr", _FakeStderr(False))
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert cdm._color_enabled() is False
+
+
+def test_main_invalid_dir(tmp_path, monkeypatch):
+    bad = tmp_path / "does-not-exist"
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(bad),
+    ])
+    with pytest.raises(SystemExit):
+        main()
+
+
+def test_main_minimal_writes_default_path(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    meta = make_meta(date="2020", label="Some Label")
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio),
+    ])
+    main()
+    default_out = audio / "metadata.json"
+    assert default_out.exists()
+    assert json.loads(default_out.read_text())["album"] == "Some Album"
+    # Nothing on stdout — JSON lives in the file.
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    # Summary on stderr.
+    assert "Album:        Some Album" in captured.err
+    assert "Album artist: Some Artist" in captured.err
+    assert "Year:         2020" in captured.err
+    assert "Label:        Some Label" in captured.err
+    assert "Tracks:       2" in captured.err
+    assert f"Wrote:        {default_out}" in captured.err
+
+
+def test_main_summary_handles_missing_optional_fields(tmp_path, monkeypatch, capsys):
+    """date and label are optional → summary renders '-'."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    meta = make_meta()  # no date, no label, no notes
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio),
+    ])
+    main()
+    err = capsys.readouterr().err
+    assert "Year:         -" in err
+    assert "Label:        -" in err
+    # Notes section is suppressed when meta.notes is empty.
+    assert "Notes:" not in err
+
+
+def test_main_summary_emits_notes_when_present(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    meta = make_meta(notes="Page lists 13 tracks; aligned first 12.\nTrack 5 duration off by 8s.")
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio),
+    ])
+    main()
+    err = capsys.readouterr().err
+    assert "Notes:" in err
+    assert "  Page lists 13 tracks; aligned first 12." in err
+    assert "  Track 5 duration off by 8s." in err
+
+
+def test_main_full_flow(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    out_path = tmp_path / "tags.json"
+    meta = make_meta()
+    monkeypatch.setattr(
+        cdm, "load_local_tracks",
+        lambda d: [{"position": 1, "filename": "x.flac", "duration_seconds": 1.0}],
+    )
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    write_called: list = []
+    rename_called: list = []
+    monkeypatch.setattr(
+        cdm, "write_tags",
+        lambda d, m: write_called.append((d, m)),
+    )
+    # --rename returns a path → the default output should follow it,
+    # but here --out is explicit so it should win.
+    new_dir = tmp_path / "renamed"
+    new_dir.mkdir()
+    monkeypatch.setattr(
+        cdm, "rename_release",
+        lambda d, m: rename_called.append((d, m)) or new_dir,
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py",
+        "--url", "http://x",
+        "--dir", str(audio),
+        "--out", str(out_path),
+        "--write",
+        "--rename",
+    ])
+    main()
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no more stdout JSON
+    assert out_path.exists()
+    assert json.loads(out_path.read_text())["album"] == "Some Album"
+    assert write_called and rename_called
+    assert f"Wrote:        {out_path}" in captured.err
+
+
+def test_main_rename_redirects_default_out(tmp_path, monkeypatch, capsys):
+    """Without --out, default landing follows the renamed directory."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    new_dir = tmp_path / "Some Artist - Some Album (2020) [FLAC]"
+    new_dir.mkdir()
+    meta = make_meta(date="2020")
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(cdm, "rename_release", lambda d, m: new_dir)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio), "--rename",
+    ])
+    main()
+    expected = new_dir / "metadata.json"
+    assert expected.exists()
+    assert f"Wrote:        {expected}" in capsys.readouterr().err
+
+
+def test_main_rename_failure_falls_back_to_original_dir(tmp_path, monkeypatch):
+    """If rename_release returns None, default --out stays in args.dir."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    meta = make_meta()
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(cdm, "rename_release", lambda d, m: None)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio), "--rename",
+    ])
+    main()
+    assert (audio / "metadata.json").exists()
+
+
+# ---------- --metadata mode ----------
+
+def _seed_metadata_json(audio_dir: Path, meta=None) -> Path:
+    """Write a metadata.json into the audio dir so --metadata can reuse it."""
+    meta = meta or make_meta(date="2020", label="Some Label")
+    path = audio_dir / "metadata.json"
+    path.write_text(meta.model_dump_json(indent=2))
+    return path
+
+
+def test_main_metadata_skips_lmstudio(tmp_path, monkeypatch, capsys, caplog):
+    caplog.set_level(logging.INFO, logger="cd_metadata")
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    _seed_metadata_json(audio)
+
+    # Make any accidental LM Studio path fail loudly.
+    def boom(*a, **k):
+        raise AssertionError("LM Studio path should not run in --metadata mode")
+    monkeypatch.setattr(cdm, "load_local_tracks", boom)
+    monkeypatch.setattr(cdm, "fetch_page_text", boom)
+    monkeypatch.setattr(cdm, "query_lmstudio", boom)
+
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--metadata", "--dir", str(audio),
+    ])
+    main()
+    assert f"Loading metadata from {audio / 'metadata.json'}" in caplog.text
+    err = capsys.readouterr().err
+    assert "Album:        Some Album" in err
+    assert "Year:         2020" in err
+
+
+def test_main_metadata_applies_write_and_rename(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    _seed_metadata_json(audio)
+
+    def boom(*a, **k):  # ensure LM Studio not consulted
+        raise AssertionError("must not call LM Studio")
+    monkeypatch.setattr(cdm, "fetch_page_text", boom)
+    monkeypatch.setattr(cdm, "query_lmstudio", boom)
+    write_called: list = []
+    monkeypatch.setattr(
+        cdm, "write_tags", lambda d, m: write_called.append((d, m))
+    )
+    new_dir = tmp_path / "Some Artist - Some Album (2020) [FLAC]"
+    new_dir.mkdir()
+    # Carry the seeded metadata file into the simulated renamed dir so the
+    # post-rename write to <new_dir>/metadata.json reuses that path cleanly.
+    (new_dir / "metadata.json").write_text(
+        (audio / "metadata.json").read_text()
+    )
+    monkeypatch.setattr(cdm, "rename_release", lambda d, m: new_dir)
+
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--metadata", "--dir", str(audio),
+        "--write", "--rename",
+    ])
+    main()
+    assert write_called and write_called[0][0] == audio
+    assert (new_dir / "metadata.json").exists()
+
+
+def test_main_metadata_missing_file_exits(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()  # no metadata.json inside
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--metadata", "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert "No metadata file" in str(exc.value)
+
+
+def test_main_metadata_cleans_disambiguators_on_load(tmp_path, monkeypatch, capsys):
+    """If the on-disk JSON has wiki-style disambiguators, clean_metadata still strips them."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    dirty = make_meta(
+        album="Discovery (album)",
+        tracks=[Track(track_number=1, title="One More Time (song)")],
+    )
+    _seed_metadata_json(audio, meta=dirty)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--metadata", "--dir", str(audio),
+    ])
+    main()
+    on_disk = json.loads((audio / "metadata.json").read_text())
+    assert on_disk["album"] == "Discovery"
+    assert on_disk["tracks"][0]["title"] == "One More Time"
+
+
+def test_main_requires_url_or_metadata(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit):
+        main()
+    assert "one of the arguments" in capsys.readouterr().err.lower()
+
+
+def test_main_url_and_metadata_mutually_exclusive(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--metadata", "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit):
+        main()
+    assert "not allowed with" in capsys.readouterr().err.lower()
+
+
+# ---------- --image mode ----------
+
+def test_main_image_skips_url_path(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    img = tmp_path / "back.jpg"
+    img.write_bytes(b"")
+
+    def boom(*a, **k):
+        raise AssertionError("URL/text path should not run in --image mode")
+    monkeypatch.setattr(cdm, "fetch_page_text", boom)
+    monkeypatch.setattr(cdm, "query_lmstudio", boom)
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    captured: list = []
+    monkeypatch.setattr(
+        cdm, "query_lmstudio_image",
+        lambda model, path, tracks: captured.append((model, path, tracks)) or make_meta(),
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--image", str(img), "--dir", str(audio),
+    ])
+    main()
+    assert captured and captured[0][1] == img
+    assert (audio / "metadata.json").exists()
+
+
+def test_main_image_not_a_file_exits(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py",
+        "--image", str(tmp_path / "does-not-exist.jpg"),
+        "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert "Not a file" in str(exc.value)
+
+
+def test_main_image_unsupported_format_exits(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    img = tmp_path / "back.tiff"
+    img.write_bytes(b"")
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--image", str(img), "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    msg = str(exc.value)
+    assert "Unsupported image format" in msg
+    assert ".tiff" in msg
+
+
+# ---------- _resolve_image (HEIC conversion) ----------
+
+class TestResolveImage:
+    def test_passthrough_for_non_heic(self, tmp_path, monkeypatch):
+        jpg = tmp_path / "back.jpg"
+        jpg.write_bytes(b"data")
+        called: list = []
+        monkeypatch.setattr(
+            cdm.subprocess, "run", lambda *a, **k: called.append(1),
+        )
+        with cdm._resolve_image(jpg) as resolved:
+            assert resolved is jpg
+        assert called == []
+
+    def test_converts_heic_via_sips(self, tmp_path, monkeypatch):
+        heic = tmp_path / "back.heic"
+        heic.write_bytes(b"")
+        captured: list = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"FAKE JPEG")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with cdm._resolve_image(heic) as resolved:
+            assert resolved.suffix == ".jpg"
+            assert resolved.read_bytes() == b"FAKE JPEG"
+            assert resolved.exists()
+        # Cleanup after exit
+        assert not resolved.exists()
+        # sips called with the expected args
+        assert captured[0][:5] == ["sips", "-s", "format", "jpeg", str(heic)]
+
+    def test_converts_heif_too(self, tmp_path, monkeypatch):
+        heif = tmp_path / "back.heif"
+        heif.write_bytes(b"")
+
+        def fake_run(cmd, **kwargs):
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"data")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with cdm._resolve_image(heif) as resolved:
+            assert resolved.suffix == ".jpg"
+
+    def test_cleans_up_on_exception(self, tmp_path, monkeypatch):
+        heic = tmp_path / "back.heic"
+        heic.write_bytes(b"")
+
+        def fake_run(cmd, **kwargs):
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"data")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        captured: list = []
+        with pytest.raises(RuntimeError):
+            with cdm._resolve_image(heic) as resolved:
+                captured.append(resolved)
+                raise RuntimeError("downstream blew up")
+        assert captured and not captured[0].exists()
+
+    def test_sips_not_found_exits(self, tmp_path, monkeypatch):
+        heic = tmp_path / "back.heic"
+        heic.write_bytes(b"")
+
+        def fake_run(*a, **k):
+            raise FileNotFoundError("no sips")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            with cdm._resolve_image(heic):
+                pass
+        assert "sips not found" in str(exc.value)
+
+    def test_sips_failure_exits(self, tmp_path, monkeypatch):
+        heic = tmp_path / "back.heic"
+        heic.write_bytes(b"")
+        monkeypatch.setattr(
+            cdm.subprocess, "run",
+            lambda *a, **k: MagicMock(returncode=1, stderr="bad input", stdout=""),
+        )
+        with pytest.raises(SystemExit) as exc:
+            with cdm._resolve_image(heic):
+                pass
+        assert "sips failed" in str(exc.value)
+        assert "bad input" in str(exc.value)
+
+    def test_sips_failure_with_empty_output(self, tmp_path, monkeypatch):
+        """Cover the '(no message)' fallback when sips emits no stderr/stdout."""
+        heic = tmp_path / "back.heic"
+        heic.write_bytes(b"")
+        monkeypatch.setattr(
+            cdm.subprocess, "run",
+            lambda *a, **k: MagicMock(returncode=1, stderr="", stdout=""),
+        )
+        with pytest.raises(SystemExit) as exc:
+            with cdm._resolve_image(heic):
+                pass
+        assert "(no message)" in str(exc.value)
+
+
+def test_main_image_heic_runs_sips_and_passes_jpg(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="cd_metadata")
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    heic = tmp_path / "back.heic"
+    heic.write_bytes(b"")
+
+    def fake_run(cmd, **kwargs):
+        out_path = Path(cmd[cmd.index("--out") + 1])
+        out_path.write_bytes(b"FAKE JPEG")
+        return MagicMock(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    seen: list = []
+    monkeypatch.setattr(
+        cdm, "query_lmstudio_image",
+        lambda model, path, tracks: seen.append(path) or make_meta(),
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--image", str(heic), "--dir", str(audio),
+    ])
+    main()
+    assert seen and seen[0].suffix == ".jpg"
+    assert seen[0] != heic  # converted path, not the original
+    assert "Converted" in caplog.text and "sips" in caplog.text
+
+
+def test_main_url_and_image_mutually_exclusive(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    img = tmp_path / "back.jpg"
+    img.write_bytes(b"")
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py",
+        "--url", "http://x",
+        "--image", str(img),
+        "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit):
+        main()
+    assert "not allowed with" in capsys.readouterr().err.lower()
