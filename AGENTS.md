@@ -71,6 +71,14 @@ on whatever is currently loaded.
   are passed as `response_format=` to LM Studio. Changing field names or
   types changes what the model is asked to produce — update the
   `SYSTEM_PROMPT` in lockstep.
+- **`album`, `album_artist`, and `Track.title` are deliberately
+  Optional.** When they were required, the JSON schema forbade null
+  → the model confabulated values it could not actually read (most
+  visible with `--image`). With them Optional, the model can return
+  null and the user fixes it via the `--metadata` workflow. Do not
+  make them required again without understanding this trade-off.
+  `write_tags` and `rename_release` refuse to act when these are null
+  and tell the user to edit `metadata.json` — preserve that guard.
 - **`SYSTEM_PROMPT` is the spec for extraction.** When you change rules
   (date formats, disambiguator stripping, alignment behavior), edit the
   prompt; don't try to post-process around the model.
@@ -88,7 +96,17 @@ on whatever is currently loaded.
   to `SYSTEM_PROMPT`. Drops the JSON-LD and wiki-disambiguator rules
   (irrelevant for covers), adds illegible/cropped/obscured guidance.
   Keep both prompts in sync on shared rules (alignment, date format,
-  null for missing).
+  null for missing). The prompt deliberately leads with `CRITICAL
+  RULES` and an anti-bias clause: "track list is for ALIGNMENT ONLY,
+  do not infer the album from it." Don't soften that — it's what
+  stops the model from guessing the album from track count + durations.
+- **Image attachment is sandwiched between two text parts.**
+  `query_lmstudio_image` calls `chat.add_user_message([intro, handle,
+  alignment])` — the lmstudio SDK accepts a list mixing strings and
+  `FileHandle`. `build_image_chat_text` returns the two text parts;
+  the image goes between them so the model meets instructions, then
+  the image, then the track-alignment data (not before). This
+  structure measurably reduces image-mode hallucinations.
 - **`IMAGE_EXTS` is an allowlist of `.jpg/.jpeg/.png/.webp`** — these
   go straight to LM Studio. **`HEIC_EXTS` (`.heic/.heif`) are accepted
   too**, but transparently converted to JPEG via macOS `sips` by the

@@ -140,8 +140,8 @@ def log_summary(meta: AlbumMetadata, out_path: Path) -> None:
         "Label:        %s\n"
         "Tracks:       %d\n"
         "Wrote:        %s",
-        meta.album,
-        meta.album_artist,
+        meta.album or "-",
+        meta.album_artist or "-",
         year,
         meta.label or "-",
         len(meta.tracks),
@@ -187,15 +187,23 @@ USER_AGENT = "cd-metadata/0.1 (+https://github.com/local/cd-metadata)"
 class Track(BaseModel):
     track_number: int
     disc_number: int = 1
-    title: str
+    # Optional so the model can return null per-track when illegible (image
+    # mode) or absent (text mode), instead of confabulating a title. Editable
+    # by the user via the metadata.json + --metadata workflow.
+    title: str | None = None
     artist: str | None = None
     composer: str | None = None
     duration_seconds: float | None = None
 
 
 class AlbumMetadata(BaseModel):
-    album: str
-    album_artist: str
+    # `album` and `album_artist` are Optional so the model is permitted to
+    # admit it cannot read these from the source. With them required, the
+    # response_format=AlbumMetadata schema forced the model to invent values
+    # even when the image/page didn't contain them. Downstream code
+    # (write_tags, rename_release) refuses to act on null required fields.
+    album: str | None = None
+    album_artist: str | None = None
     date: str | None = None
     label: str | None = None
     catalog_number: str | None = None
@@ -220,13 +228,22 @@ Rules:
 
 IMAGE_SYSTEM_PROMPT = """You extract album metadata from a photo of a CD release (back cover, liner notes, insert, label, etc.) and align it to a user's ripped CD tracks.
 
-Rules:
-- Use ONLY information visible in the image. Never invent values.
-- For any field not visible, return null.
-- The user provides their actual track count and per-track durations in file order. Align the image's tracklist to those tracks IN ORDER.
+Core rules:
+- The image is your source of truth. Transcribe what you can read from it. If text required some effort to read but you can read it, transcribe it — do not return null just because OCR was not effortless.
+- Return null ONLY when a field is not present in the image (e.g., the back cover does not list a year) or when the text is genuinely unreadable (fully covered, cropped off, severely damaged). "Not perfectly clear" is NOT a reason to return null.
+- Do not invent values that are not present in the image. If a field is genuinely absent or unreadable, return null and briefly explain in `notes`.
+- The user's ripped track list (filenames and durations) is for ALIGNMENT only. Use it to match positions to the tracklist you read FROM THE IMAGE — do not use track count or durations to identify the album or fill in track titles you cannot actually read.
+
+Workflow:
+1. Read the image. Identify the visible text: album title, artist, track titles, label, year, catalog number.
+2. Transcribe each visible field. Use null only for fields not present in the image or text you genuinely cannot read.
+3. Align the visible tracklist to the user's ripped track positions, IN ORDER.
+
+Additional rules:
 - If the image's tracklist count does not match the rip's track count, fill what you can and explain the discrepancy in `notes`.
 - If the image lists durations, verify alignment; flag mismatches greater than 5 seconds in `notes`.
-- If part of the tracklist (or any other field) is illegible, obscured, cropped, or cut off, return null for that field and note the gap in `notes`.
+- If a portion of the tracklist is genuinely unreadable (covered, cropped, damaged), return null for those track titles and note the gap in `notes`.
+- If you return null for `album` or `album_artist`, describe in `notes` what you DID see (e.g., "back cover with white text on black, label visible as 'XYZ Records', album title torn off").
 - Emit track_number starting at 1, matching the order of the user's files.
 - Dates: "YYYY" or "YYYY-MM-DD" only if the image is that specific.
 """
@@ -326,15 +343,33 @@ def query_lmstudio(
     return clean_metadata(meta)
 
 
-def build_image_user_message(local_tracks: list[dict]) -> str:
+def build_image_chat_text(local_tracks: list[dict]) -> tuple[str, str]:
+    """Returns (intro_before_image, alignment_after_image).
+
+    The image is attached BETWEEN these two text parts so the model reads
+    instructions, then the image, then the alignment data. Putting the
+    track list AFTER the image discourages the model from using durations
+    as an album fingerprint before it has actually looked at the photo.
+    """
     track_list = "\n".join(
         f"  {t['position']}. {t['filename']} ({t['duration_seconds']}s)"
         for t in local_tracks
     )
-    return (
-        f"My ripped CD has {len(local_tracks)} track(s) in this order:\n{track_list}\n\n"
-        "Extract the album metadata from the attached image."
+    intro = (
+        "Below is an image of an album release. Transcribe the metadata you "
+        "can read from the image.\n\n"
+        f"The user has {len(local_tracks)} ripped track(s); their filenames "
+        "and durations follow AFTER the image. That list is for ALIGNMENT "
+        "only — match the tracklist you read from the image to those "
+        "positions. Do not use the durations, filenames, or count to invent "
+        "an album identity or track titles that are not visible in the image."
     )
+    alignment = (
+        f"User's {len(local_tracks)} ripped track(s) "
+        "(align these positions to the tracklist you read from the image):\n"
+        f"{track_list}"
+    )
+    return intro, alignment
 
 
 @contextlib.contextmanager
@@ -376,14 +411,16 @@ def query_lmstudio_image(
     image_path: Path,
     local_tracks: list[dict],
 ) -> AlbumMetadata:
+    intro, alignment = build_image_chat_text(local_tracks)
     with lms.Client() as client:
         handle = client.prepare_image(image_path)
         model = client.llm.model(
             model_name) if model_name else client.llm.model()
         chat = lms.Chat(IMAGE_SYSTEM_PROMPT)
-        chat.add_user_message(
-            build_image_user_message(local_tracks), images=[handle]
-        )
+        # Image attached between the two text parts. The lmstudio SDK accepts
+        # a list mixing text and FileHandle as `content`; this is the only way
+        # to position the image in the middle of the user turn.
+        chat.add_user_message([intro, handle, alignment])
         result = model.respond(chat, response_format=AlbumMetadata)
     parsed = result.parsed
     meta = parsed if isinstance(
@@ -399,6 +436,14 @@ def write_tags(audio_dir: Path, meta: AlbumMetadata) -> None:
             "%d audio files vs %d parsed tracks; refusing to write. "
             "Inspect the JSON and re-run with corrected input.",
             len(files), len(meta.tracks),
+        )
+        return
+    if meta.album is None or meta.album_artist is None or any(
+        t.title is None for t in meta.tracks
+    ):
+        logger.warning(
+            "album, album_artist, or a track title is null; refusing to "
+            "write tags. Edit metadata.json to fill them in and retry."
         )
         return
     for path, track in zip(files, meta.tracks):
@@ -430,9 +475,11 @@ def strip_disambiguator(title: str) -> str:
 
 
 def clean_metadata(meta: AlbumMetadata) -> AlbumMetadata:
-    meta.album = strip_disambiguator(meta.album)
+    if meta.album is not None:
+        meta.album = strip_disambiguator(meta.album)
     for t in meta.tracks:
-        t.title = strip_disambiguator(t.title)
+        if t.title is not None:
+            t.title = strip_disambiguator(t.title)
     return meta
 
 
@@ -449,6 +496,14 @@ def rename_release(audio_dir: Path, meta: AlbumMetadata) -> Path | None:
         logger.warning(
             "%d files vs %d tracks; refusing to rename.",
             len(files), len(meta.tracks),
+        )
+        return None
+    if meta.album is None or meta.album_artist is None or any(
+        t.title is None for t in meta.tracks
+    ):
+        logger.warning(
+            "album, album_artist, or a track title is null; refusing to "
+            "rename. Edit metadata.json to fill them in and retry."
         )
         return None
 

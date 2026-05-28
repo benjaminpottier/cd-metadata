@@ -16,7 +16,7 @@ import cd_metadata as cdm
 from cd_metadata import (
     AlbumMetadata,
     Track,
-    build_image_user_message,
+    build_image_chat_text,
     build_user_message,
     clean_metadata,
     fetch_discogs,
@@ -111,6 +111,22 @@ def test_clean_metadata_strips_album_and_tracks():
     assert cleaned.album == "Discovery"
     assert cleaned.tracks[0].title == "One More Time"
     assert cleaned.tracks[1].title == "Aerodynamic"
+
+
+def test_clean_metadata_handles_none_fields():
+    """Cover the False side of `if meta.album is not None` and `if t.title is not None`."""
+    meta = AlbumMetadata(
+        album=None,
+        album_artist=None,
+        tracks=[
+            Track(track_number=1, title=None),
+            Track(track_number=2, title="Visible (album)"),  # this one still strips
+        ],
+    )
+    cleaned = clean_metadata(meta)
+    assert cleaned.album is None
+    assert cleaned.tracks[0].title is None
+    assert cleaned.tracks[1].title == "Visible"
 
 
 # ---------- sanitize ----------
@@ -319,21 +335,26 @@ class TestQueryLmstudio:
         assert out.tracks[0].title == "T"
 
 
-# ---------- build_image_user_message ----------
+# ---------- build_image_chat_text ----------
 
-class TestBuildImageUserMessage:
-    def test_includes_track_count_and_listing(self):
-        msg = build_image_user_message([
+class TestBuildImageChatText:
+    def test_returns_intro_and_alignment_parts(self):
+        tracks = [
             {"position": 1, "filename": "01.flac", "duration_seconds": 30.5},
             {"position": 2, "filename": "02.flac", "duration_seconds": 45.0},
-        ])
-        assert "2 track(s)" in msg
-        assert "01.flac" in msg
-        assert "02.flac" in msg
-        assert "attached image" in msg
-        # No URL or page text — those are URL-mode concerns.
-        assert "Source URL" not in msg
-        assert "PAGE TEXT" not in msg
+        ]
+        intro, alignment = build_image_chat_text(tracks)
+        # Intro must tell the model to transcribe from the image and warn
+        # against using the track list as identification.
+        assert "from the image" in intro.lower()
+        assert "alignment" in intro.lower()
+        assert "2 ripped track(s)" in intro
+        # Alignment carries the actual file list AFTER the image.
+        assert "01.flac" in alignment
+        assert "02.flac" in alignment
+        # No URL/page-text leakage from the text-mode helper.
+        assert "Source URL" not in intro and "Source URL" not in alignment
+        assert "PAGE TEXT" not in intro and "PAGE TEXT" not in alignment
 
 
 # ---------- query_lmstudio_image ----------
@@ -359,10 +380,15 @@ class TestQueryLmstudioImage:
         assert isinstance(out, AlbumMetadata)
         client.prepare_image.assert_called_once_with(img)
         client.llm.model.assert_called_once_with("my-model")
-        # Image handle should be plumbed through to add_user_message(images=...).
+        # Content is a [intro, handle, alignment] list — image sandwiched
+        # between text parts.
         chat = fake_lms.Chat.return_value
-        _, kwargs = chat.add_user_message.call_args
-        assert kwargs["images"] == [client.prepare_image.return_value]
+        args, _ = chat.add_user_message.call_args
+        content = args[0]
+        assert isinstance(content, list) and len(content) == 3
+        assert isinstance(content[0], str)
+        assert content[1] is client.prepare_image.return_value
+        assert isinstance(content[2], str)
         # And the chat is built from the image-specific system prompt.
         fake_lms.Chat.assert_called_once_with(cdm.IMAGE_SYSTEM_PROMPT)
 
@@ -458,6 +484,36 @@ class TestWriteTags:
         write_tags(tmp_path, meta)
         assert "unsupported tag format" in caplog.text
 
+    def test_refuses_on_null_album(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        touch(tmp_path / "01.flac")
+        meta = make_meta(
+            album=None,
+            tracks=[Track(track_number=1, title="A")],
+        )
+        called: list = []
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda *a, **k: called.append(1)),
+        )
+        write_tags(tmp_path, meta)
+        assert "null" in caplog.text.lower()
+        assert "refusing to write" in caplog.text
+        assert called == []
+
+    def test_refuses_on_null_track_title(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        touch(tmp_path / "01.flac")
+        meta = make_meta(tracks=[Track(track_number=1, title=None)])
+        called: list = []
+        monkeypatch.setattr(
+            cdm, "mutagen",
+            MagicMock(File=lambda *a, **k: called.append(1)),
+        )
+        write_tags(tmp_path, meta)
+        assert "null" in caplog.text.lower()
+        assert called == []
+
 
 # ---------- rename_release ----------
 
@@ -527,6 +583,32 @@ class TestRenameRelease:
         ])
         rename_release(d, meta)
         assert "target exists, skipping" in caplog.text
+
+    def test_refuses_on_null_album_artist(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "a.flac")
+        touch(d / "b.flac")
+        meta = make_meta(album_artist=None)  # default tracks have titles
+        assert rename_release(d, meta) is None
+        assert "null" in caplog.text.lower()
+        assert "refusing to rename" in caplog.text
+        # Directory not renamed.
+        assert d.exists()
+
+    def test_refuses_on_null_track_title(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="cd_metadata")
+        d = tmp_path / "rips"
+        d.mkdir()
+        touch(d / "a.flac")
+        touch(d / "b.flac")
+        meta = make_meta(tracks=[
+            Track(track_number=1, title="Visible"),
+            Track(track_number=2, title=None),
+        ])
+        assert rename_release(d, meta) is None
+        assert "null" in caplog.text.lower()
 
 
 # ---------- main ----------
@@ -676,6 +758,49 @@ def test_main_summary_handles_missing_optional_fields(tmp_path, monkeypatch, cap
     assert "Label:        -" in err
     # Notes section is suppressed when meta.notes is empty.
     assert "Notes:" not in err
+
+
+def test_main_summary_renders_dash_for_null_album(tmp_path, monkeypatch, capsys):
+    """Null album / album_artist render as '-' in the summary so the user
+    sees they need editing before running --write/--rename."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    meta = make_meta(album=None, album_artist=None)
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+    monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--url", "http://x", "--dir", str(audio),
+    ])
+    main()
+    err = capsys.readouterr().err
+    assert "Album:        -" in err
+    assert "Album artist: -" in err
+
+
+def test_main_metadata_roundtrips_null_fields(tmp_path, monkeypatch, capsys):
+    """JSON with null album/artist/title loads, cleans, and re-writes intact."""
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    payload = {
+        "album": None,
+        "album_artist": None,
+        "tracks": [
+            {"track_number": 1, "title": None},
+            {"track_number": 2, "title": "Legible"},
+        ],
+        "notes": "back cover photographed at an angle; title obscured.",
+    }
+    (audio / "metadata.json").write_text(json.dumps(payload))
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--metadata", "--dir", str(audio),
+    ])
+    main()
+    on_disk = json.loads((audio / "metadata.json").read_text())
+    assert on_disk["album"] is None
+    assert on_disk["album_artist"] is None
+    assert on_disk["tracks"][0]["title"] is None
+    assert on_disk["tracks"][1]["title"] == "Legible"
 
 
 def test_main_summary_emits_notes_when_present(tmp_path, monkeypatch, capsys):
