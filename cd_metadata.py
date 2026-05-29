@@ -342,6 +342,10 @@ Additional rules:
 """
 
 
+def _audio_files(d: Path) -> list[Path]:
+    return sorted(p for p in d.iterdir() if p.suffix.lower() in AUDIO_EXTS)
+
+
 def load_local_tracks(audio_dir: Path) -> list[dict]:
     files = sorted(p for p in audio_dir.iterdir()
                    if p.suffix.lower() in AUDIO_EXTS)
@@ -384,14 +388,12 @@ def fetch_page_text(url: str) -> str:
     resp.raise_for_status()
     raw = resp.text
 
+    soup = BeautifulSoup(raw, "html.parser")
     ld_blocks: list[str] = []
-    for s in BeautifulSoup(raw, "html.parser").find_all(
-        "script", type="application/ld+json"
-    ):
+    for s in soup.find_all("script", type="application/ld+json"):
         if s.string:
             ld_blocks.append(s.string.strip())
 
-    soup = BeautifulSoup(raw, "html.parser")
     for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
         tag.decompose()
     body_text = soup.get_text("\n", strip=True)
@@ -663,9 +665,16 @@ def query_lmstudio_image(
     return clean_metadata(meta)
 
 
+def _metadata_is_incomplete(meta: AlbumMetadata) -> bool:
+    return (
+        meta.album is None
+        or meta.album_artist is None
+        or any(t.title is None for t in meta.tracks)
+    )
+
+
 def write_tags(audio_dir: Path, meta: AlbumMetadata) -> None:
-    files = sorted(p for p in audio_dir.iterdir()
-                   if p.suffix.lower() in AUDIO_EXTS)
+    files = _audio_files(audio_dir)
     if len(files) != len(meta.tracks):
         logger.warning(
             "%d audio files vs %d parsed tracks; refusing to write. "
@@ -673,9 +682,7 @@ def write_tags(audio_dir: Path, meta: AlbumMetadata) -> None:
             len(files), len(meta.tracks),
         )
         return
-    if meta.album is None or meta.album_artist is None or any(
-        t.title is None for t in meta.tracks
-    ):
+    if _metadata_is_incomplete(meta):
         logger.warning(
             "album, album_artist, or a track title is null; refusing to "
             "write tags. Edit metadata.json to fill them in and retry."
@@ -725,17 +732,14 @@ def sanitize(name: str) -> str:
 
 def rename_release(audio_dir: Path, meta: AlbumMetadata) -> Path | None:
     """Rename the directory and its files per "%A - %T (%y) [%f]/%n. %t"."""
-    files = sorted(p for p in audio_dir.iterdir()
-                   if p.suffix.lower() in AUDIO_EXTS)
+    files = _audio_files(audio_dir)
     if len(files) != len(meta.tracks):
         logger.warning(
             "%d files vs %d tracks; refusing to rename.",
             len(files), len(meta.tracks),
         )
         return None
-    if meta.album is None or meta.album_artist is None or any(
-        t.title is None for t in meta.tracks
-    ):
+    if _metadata_is_incomplete(meta):
         logger.warning(
             "album, album_artist, or a track title is null; refusing to "
             "rename. Edit metadata.json to fill them in and retry."
@@ -759,8 +763,7 @@ def rename_release(audio_dir: Path, meta: AlbumMetadata) -> Path | None:
         logger.info("Renamed dir: %s -> %s", audio_dir.name, target_dir.name)
 
     width = max(2, len(str(len(meta.tracks))))
-    files_now = sorted(p for p in target_dir.iterdir()
-                       if p.suffix.lower() in AUDIO_EXTS)
+    files_now = _audio_files(target_dir)
     for path, track in zip(files_now, meta.tracks):
         base = sanitize(f"{track.track_number:0{width}d}. {track.title}")
         new_path = target_dir / (base + path.suffix.lower())
@@ -799,8 +802,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--model",
-        default="mlx-qwen3.5-9b-glm5.1-distill-v1@8bit",
-        help="LM Studio model identifier (default: currently loaded model)",
+        default="qwen2.5-vl-32b-instruct",
+        help="LM Studio model identifier (default: qwen2.5-vl-32b-instruct, "
+        "validated to handle both URL and image modes well)",
     )
     ap.add_argument(
         "--out",
