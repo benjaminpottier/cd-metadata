@@ -16,15 +16,16 @@ review) and the model does the extraction.
 
 ## Repo layout
 
-- `cd_metadata.py` — the whole tool. One file, no package.
-- `test_cd_metadata.py` — pytest suite at the repo root, paired with the tool.
+- `cd_metadata.py` — the core tool. One file, no package.
+- `test_cd_metadata.py` — pytest suite.
 - `pyproject.toml` — dependencies, managed by `uv`. Test deps live in the `dev` dependency group.
 - `uv.lock` — pinned lockfile; commit changes when deps move.
 - **Use `uv` for everything**: dependency management, running, testing. Don't forget it's required.
 - `command.example` — example invocation.
 - `.venv/` — created by `uv sync`. Do not commit.
 
-There is intentionally no `src/` layout and no CI. Tests sit next to the tool and run with `pytest`.
+There is intentionally no `src/` layout and no CI. Tests sit next to the
+tool and run with `pytest`.
 
 ## Running it
 
@@ -34,8 +35,8 @@ uv sync                        # one-time, installs into .venv
 # First pass — text mode: LM Studio call, writes <dir>/metadata.json
 uv run cd_metadata.py --url URL --dir PATH_TO_RIPS
 
-# Or — image mode: send a back-cover photo to a vision-capable model
-uv run cd_metadata.py --image PATH_TO_IMAGE --dir PATH_TO_RIPS
+# Or — image mode: send one or more photos to a vision-capable model
+uv run cd_metadata.py --image PATH_TO_IMAGE [PATH_TO_IMAGE ...] --dir PATH_TO_RIPS
 
 # Second pass: reuse the metadata, apply tags/rename without re-calling LM Studio
 uv run cd_metadata.py --metadata --dir PATH_TO_RIPS --write --rename
@@ -43,9 +44,12 @@ uv run cd_metadata.py --metadata --dir PATH_TO_RIPS --write --rename
 
 Exactly one of `--url`, `--image`, or `--metadata` is required (argparse
 mutually exclusive group). `--metadata` reads `<dir>/metadata.json` and
-skips the network fetch + LM Studio call entirely. `--image` accepts
-JPEG/PNG/WebP (`IMAGE_EXTS`) directly, plus HEIC/HEIF (`HEIC_EXTS`) which
-are auto-converted via macOS `sips`.
+skips the network fetch + LM Studio call entirely. `--image` accepts one
+or more JPEG/PNG/WebP (`IMAGE_EXTS`) or HEIC/HEIF (`HEIC_EXTS`) files;
+every image is routed through macOS `sips` for normalization (format
+convert if needed, EXIF orientation bake, optional downscale to
+`IMAGE_MAX_DIMENSION = 2048` on the longest side). Multiple images are
+attached to the same chat turn as different views of the same release.
 
 ## Running tests
 
@@ -67,10 +71,27 @@ on whatever is currently loaded.
 
 - **Single file, flat functions.** Don't refactor into a package, classes,
   or multiple modules. The file is small enough to read top-to-bottom.
-- **Pydantic models define the LLM contract.** `Track` and `AlbumMetadata`
-  are passed as `response_format=` to LM Studio. Changing field names or
-  types changes what the model is asked to produce — update the
-  `SYSTEM_PROMPT` in lockstep.
+- **Pydantic models define the LLM contracts.** `Track` and
+  `AlbumMetadata` are the final shape. The URL flow uses two narrower
+  intermediate schemas — `AlbumScalars` (album-level fields + notes) and
+  `TrackTitlesAndNotes` (a `list[str]` of titles + notes) — one per LLM
+  call, then merges into `AlbumMetadata`. The image flow still uses
+  `AlbumMetadata` directly. Changing field names or types changes what
+  each model is asked to produce; update the corresponding prompt in
+  lockstep.
+- **`TrackTitlesAndNotes.track_titles` is `list[str]`, not
+  `list[Track]` and not `list[str | None]`.** Local quantized models
+  under structured output exhibit a strong null bias on `str | None`
+  fields — when the schema is `list[Track]` with `Track.title: str | None`,
+  every track in the release came back with `title: null` even when the
+  page clearly stated all titles (the constrained decoder picks `null`
+  as the easier completion, and once one position is null, consistency
+  makes the rest null too). The required-string schema removes the null
+  escape hatch; the prompt instead tells the model to emit "" for "not
+  stated on the page". `query_lmstudio` then maps "" back to `None` and
+  builds `Track` objects with the right `track_number`. Don't reintroduce
+  `Track | None` in the LLM contract without re-validating extraction
+  quality against a weak local model.
 - **`album`, `album_artist`, and `Track.title` are deliberately
   Optional.** When they were required, the JSON schema forbade null
   → the model confabulated values it could not actually read (most
@@ -79,9 +100,25 @@ on whatever is currently loaded.
   make them required again without understanding this trade-off.
   `write_tags` and `rename_release` refuse to act when these are null
   and tell the user to edit `metadata.json` — preserve that guard.
-- **`SYSTEM_PROMPT` is the spec for extraction.** When you change rules
-  (date formats, disambiguator stripping, alignment behavior), edit the
-  prompt; don't try to post-process around the model.
+- **The URL flow is two-stage by design.** `query_lmstudio` makes
+  TWO sequential `model.respond` calls: pass 1 fills `AlbumScalars`
+  (album/album_artist/date/label/catalog_number/genre + notes), pass 2
+  fills `TrackTitlesAndNotes`. Local quantized models under structured output
+  default to null on optional string fields when the response schema is
+  large; splitting the work in two keeps each call's cognitive load
+  light and is what actually makes `album`/`album_artist` populate
+  reliably across diverse pages (Discogs JSON, Bandcamp, Wikipedia,
+  label sites). The scalars pass deliberately omits the user's track
+  list — filenames like "Unknown" would only prime the model toward
+  null. The tracks pass receives the scalars from pass 1 as confirmed
+  context so the model isn't tempted to second-guess the album identity.
+  Notes from both passes are concatenated. Don't collapse this back
+  into a single call without re-validating extraction quality.
+- **`SCALAR_SYSTEM_PROMPT` and `TRACKS_SYSTEM_PROMPT` are the URL-flow
+  specs.** When you change extraction rules (date formats, disambiguator
+  stripping, alignment behavior), edit the relevant prompt; don't try
+  to post-process around the model. Keep them in sync with
+  `IMAGE_SYSTEM_PROMPT` on shared rules.
 - **`--metadata` mode skips the LLM entirely.** It loads
   `<dir>/metadata.json` from a prior run, runs `clean_metadata` as a
   safety net (idempotent), then proceeds straight to `--write`/`--rename`
@@ -93,28 +130,46 @@ on whatever is currently loaded.
   source mode, add it to the same group — don't open-code the
   validation.
 - **`IMAGE_SYSTEM_PROMPT` is the spec for image extraction.** Parallel
-  to `SYSTEM_PROMPT`. Drops the JSON-LD and wiki-disambiguator rules
-  (irrelevant for covers), adds illegible/cropped/obscured guidance.
-  Keep both prompts in sync on shared rules (alignment, date format,
-  null for missing). The prompt deliberately leads with `CRITICAL
-  RULES` and an anti-bias clause: "track list is for ALIGNMENT ONLY,
-  do not infer the album from it." Don't soften that — it's what
-  stops the model from guessing the album from track count + durations.
+  to the URL-flow prompts. Drops the JSON-LD and wiki-disambiguator
+  rules (irrelevant for covers — `clean_metadata` strips disambiguators
+  post-hoc regardless), adds illegible/cropped/obscured guidance. Keep
+  the prompts in sync on shared rules (alignment, date format, null
+  for missing). The prompt's "Core rules" section deliberately
+  includes the anti-bias clause: "the user's ripped track list
+  (filenames and durations) is for ALIGNMENT only ... do not use
+  track count or durations to identify the album." Don't soften that
+  — it's what stops the model from guessing the album from track
+  count + durations.
 - **Image attachment is sandwiched between two text parts.**
-  `query_lmstudio_image` calls `chat.add_user_message([intro, handle,
-  alignment])` — the lmstudio SDK accepts a list mixing strings and
-  `FileHandle`. `build_image_chat_text` returns the two text parts;
-  the image goes between them so the model meets instructions, then
-  the image, then the track-alignment data (not before). This
-  structure measurably reduces image-mode hallucinations.
-- **`IMAGE_EXTS` is an allowlist of `.jpg/.jpeg/.png/.webp`** — these
-  go straight to LM Studio. **`HEIC_EXTS` (`.heic/.heif`) are accepted
-  too**, but transparently converted to JPEG via macOS `sips` by the
-  `_resolve_image` context manager (cleaned up on exit, including on
-  exceptions). HEIC support is macOS-only by design: `sips` not found
-  → clean `sys.exit` telling the user to convert externally. Everything
-  else (TIFF, BMP, GIF, etc.) is rejected with a clean `sys.exit`. Don't
-  introduce Pillow / pyheif / cloud converters without asking.
+  `query_lmstudio_image` takes a `list[Path]` and calls
+  `chat.add_user_message([intro, *handles, alignment])` — the lmstudio
+  SDK accepts a list mixing strings and `FileHandle`. `build_image_chat_text`
+  returns the two text parts (with phrasing that switches singular/plural
+  based on `num_images`); image(s) go between them so the model meets
+  instructions, then the image(s), then the track-alignment data (not
+  before). This structure measurably reduces image-mode hallucinations.
+- **Multiple images are supported via `nargs="+"` on `--image`.** They
+  are framed to the model as different views of the same release
+  (back cover + insert + label, etc.) — the `IMAGE_SYSTEM_PROMPT` tells
+  it to combine information across them and treat a field as null only
+  if absent/unreadable across all of them. `main` validates every path
+  up-front, then uses `contextlib.ExitStack` to manage one `_resolve_image`
+  context per file so temp JPEGs are cleaned up even if one image fails.
+- **All accepted images route through `sips` via `_resolve_image`.**
+  `IMAGE_EXTS` (`.jpg/.jpeg/.png/.webp`) and `HEIC_EXTS` (`.heic/.heif`)
+  alike are converted to a JPEG temp file with EXIF orientation baked
+  into pixels and the longest dimension capped at `IMAGE_MAX_DIMENSION`
+  (2048). The cap is gated by a `sips -g pixelWidth -g pixelHeight`
+  pre-check (`_image_needs_resize`) because `sips -Z` is bidirectional
+  — without the gate, smaller back-cover photos would be UPSCALED, which
+  is exactly the opposite of what we want. If sips can't read the dims
+  (returncode != 0 or non-numeric output), `_image_needs_resize` returns
+  True so the convert call surfaces the real error rather than silently
+  skipping the cap. All sips invocations go through `_run_sips`, which
+  centralizes the `FileNotFoundError → clean sys.exit` ("requires macOS")
+  handling. Image mode is macOS-only by design; everything else (TIFF,
+  BMP, GIF, etc.) is rejected at CLI parse with a clean `sys.exit`.
+  Don't introduce Pillow / pyheif / cloud converters without asking.
 - **Discogs is special-case.** Their pages block scraping, so
   `DISCOGS_URL_RE` routes to their public JSON API (`fetch_discogs`)
   instead of HTML fetching. Keep that branch when touching `fetch_page_text`.
@@ -137,6 +192,14 @@ on whatever is currently loaded.
   to disk — `--out` if given, otherwise `<audio_dir>/metadata.json`
   (following `--rename` to the new directory name if used). `print` is
   not used anywhere in `cd_metadata.py`; do not reintroduce it.
+- **`log_summary` emits a `Status:` line that mirrors the
+  write/rename guards.** If `album`, `album_artist`, and every
+  `Track.title` are non-null, status is "complete — ready to
+  --write/--rename"; otherwise "needs review — missing ..." enumerates
+  the specific fields. The `Tracks:` line likewise shows "N (all
+  titled)" vs. "N (K titled, M missing)". When changing the
+  `write_tags`/`rename_release` null guards, update the status check
+  in lockstep so the summary stays truthful about what's actionable.
 - **Color is auto-detected.** `_ColorFormatter` wraps the level prefix
   in ANSI codes when stderr is a TTY and `NO_COLOR` is unset
   (https://no-color.org). The summary block is intentionally uncolored

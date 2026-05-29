@@ -15,9 +15,12 @@ import pytest
 import cd_metadata as cdm
 from cd_metadata import (
     AlbumMetadata,
+    AlbumScalars,
     Track,
+    TrackTitlesAndNotes,
     build_image_chat_text,
-    build_user_message,
+    build_scalar_message,
+    build_tracks_message,
     clean_metadata,
     fetch_discogs,
     fetch_page_text,
@@ -145,28 +148,72 @@ class TestSanitize:
         assert sanitize("Normal Name") == "Normal Name"
 
 
-# ---------- build_user_message ----------
+# ---------- build_scalar_message ----------
 
-class TestBuildUserMessage:
-    def test_simple(self):
-        msg = build_user_message(
+class TestBuildScalarMessage:
+    def test_omits_filenames(self):
+        # The scalars pass intentionally does not include the user's track
+        # list — filenames like "Unknown" would only prime the model toward
+        # null. Album-level fields don't need alignment data anyway.
+        msg = build_scalar_message("http://x", "page body")
+        assert "http://x" in msg
+        assert "page body" in msg
+        assert "Unknown" not in msg
+        assert "ripped track" not in msg
+
+    def test_truncation(self):
+        long_page = "Z" * (cdm.PAGE_CHAR_BUDGET + 100)
+        msg = build_scalar_message("http://example", long_page)
+        assert "100 more chars truncated" in msg
+        assert msg.count("Z") == cdm.PAGE_CHAR_BUDGET
+
+
+# ---------- build_tracks_message ----------
+
+class TestBuildTracksMessage:
+    def test_includes_filenames_after_page(self):
+        msg = build_tracks_message(
             "http://x",
             "page body",
             [{"position": 1, "filename": "01.flac", "duration_seconds": 30.5}],
+            AlbumScalars(),
         )
         assert "http://x" in msg
         assert "01.flac" in msg
         assert "30.5" in msg
-        assert "1 track(s)" in msg
+        assert "1 ripped track(s)" in msg
         assert "page body" in msg
         assert "truncated" not in msg
+        # Page text must precede the filename block.
+        assert msg.index("page body") < msg.index("01.flac")
 
     def test_truncation(self):
         long_page = "Z" * (cdm.PAGE_CHAR_BUDGET + 100)
-        msg = build_user_message("http://example", long_page, [])
+        msg = build_tracks_message(
+            "http://example", long_page, [], AlbumScalars(),
+        )
         assert "100 more chars truncated" in msg
-        # Page-body portion is clipped to exactly PAGE_CHAR_BUDGET Z's.
         assert msg.count("Z") == cdm.PAGE_CHAR_BUDGET
+
+    def test_includes_scalar_context_block_when_present(self):
+        msg = build_tracks_message(
+            "http://x",
+            "page",
+            [],
+            AlbumScalars(
+                album="Atmosphere For Lovers And Thieves",
+                album_artist="Ben Webster",
+                date="1990",
+            ),
+        )
+        assert "Album context" in msg
+        assert "album: Atmosphere For Lovers And Thieves" in msg
+        assert "album_artist: Ben Webster" in msg
+        assert "date: 1990" in msg
+
+    def test_omits_context_block_when_scalars_empty(self):
+        msg = build_tracks_message("http://x", "page", [], AlbumScalars())
+        assert "Album context" not in msg
 
 
 # ---------- load_local_tracks ----------
@@ -299,40 +346,124 @@ class TestFetchPageText:
 
 class TestQueryLmstudio:
     @staticmethod
-    def _setup(monkeypatch, parsed):
+    def _setup(monkeypatch, scalars, tracks_and_notes):
+        """Wire up `lms.Client` so two sequential `model.respond` calls return
+        the scalars and the tracks payload respectively.
+        """
         fake_lms = MagicMock()
         client = fake_lms.Client.return_value.__enter__.return_value
         fake_lms.Client.return_value.__exit__.return_value = False
         model = client.llm.model.return_value
-        model.respond.return_value.parsed = parsed
+        scalars_result = MagicMock()
+        scalars_result.parsed = scalars
+        tracks_result = MagicMock()
+        tracks_result.parsed = tracks_and_notes
+        model.respond.side_effect = [scalars_result, tracks_result]
         monkeypatch.setattr(cdm, "lms", fake_lms)
         return fake_lms, client, model
 
     def test_with_model_name_and_pydantic_parsed(self, monkeypatch):
-        meta = make_meta()
-        _, client, model = self._setup(monkeypatch, meta)
+        scalars = AlbumScalars(album="A", album_artist="B")
+        tan = TrackTitlesAndNotes(track_titles=["T"])
+        _, client, model = self._setup(monkeypatch, scalars, tan)
         out = query_lmstudio("my-model", "http://x", "page", [])
         assert isinstance(out, AlbumMetadata)
+        assert out.album == "A"
+        assert out.album_artist == "B"
+        assert out.tracks[0].track_number == 1
+        assert out.tracks[0].title == "T"
         client.llm.model.assert_called_once_with("my-model")
-        model.respond.assert_called_once()
+        # Two passes: scalars then tracks.
+        assert model.respond.call_count == 2
 
     def test_without_model_name(self, monkeypatch):
-        meta = make_meta()
-        _, client, _ = self._setup(monkeypatch, meta)
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=[])
+        _, client, _ = self._setup(monkeypatch, scalars, tan)
         query_lmstudio(None, "http://x", "page", [])
         client.llm.model.assert_called_once_with()
 
     def test_dict_parsed_uses_model_validate(self, monkeypatch):
-        parsed_dict = {
-            "album": "A (album)",
-            "album_artist": "B",
-            "tracks": [{"track_number": 1, "title": "T (song)"}],
-        }
-        self._setup(monkeypatch, parsed_dict)
+        # Both passes return raw dicts (some lms SDK versions skip Pydantic
+        # parsing). query_lmstudio must validate them into the right models.
+        scalars_dict = {"album": "A (album)", "album_artist": "B"}
+        tracks_dict = {"track_titles": ["T (song)"]}
+        self._setup(monkeypatch, scalars_dict, tracks_dict)
         out = query_lmstudio(None, "http://x", "page", [])
         # clean_metadata strips disambiguators.
         assert out.album == "A"
         assert out.tracks[0].title == "T"
+
+    def test_empty_string_title_maps_to_none(self, monkeypatch):
+        # The "" sentinel from the model means "not stated on the page".
+        # Downstream guards (write_tags, rename_release) check `is None`,
+        # so we MUST convert "" → None here.
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=["", "Real Title", "   "])
+        self._setup(monkeypatch, scalars, tan)
+        out = query_lmstudio(None, "http://x", "page", [])
+        assert [t.title for t in out.tracks] == [None, "Real Title", None]
+        assert [t.track_number for t in out.tracks] == [1, 2, 3]
+
+    def test_padding_when_model_returns_fewer_titles(self, monkeypatch):
+        # Local model emitted only 2 titles but the rip has 3 files. Pad
+        # with title=None so positions stay 1:1 with the audio.
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=["A", "B"])
+        self._setup(monkeypatch, scalars, tan)
+        local = [
+            {"position": i, "filename": f"{i}.flac", "duration_seconds": 1.0}
+            for i in (1, 2, 3)
+        ]
+        out = query_lmstudio(None, "http://x", "page", local)
+        assert [t.title for t in out.tracks] == ["A", "B", None]
+
+    def test_truncation_when_model_returns_more_titles(self, monkeypatch):
+        # Local model overran (4 titles, 2 ripped files). Truncate so the
+        # tracks list matches the audio count — write_tags refuses on a
+        # mismatch and we don't want stray phantom tracks.
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=["A", "B", "C", "D"])
+        self._setup(monkeypatch, scalars, tan)
+        local = [
+            {"position": i, "filename": f"{i}.flac", "duration_seconds": 1.0}
+            for i in (1, 2)
+        ]
+        out = query_lmstudio(None, "http://x", "page", local)
+        assert [t.title for t in out.tracks] == ["A", "B"]
+
+    def test_no_local_tracks_uses_model_count(self, monkeypatch):
+        # If the caller supplies an empty local_tracks list, fall back to
+        # the model's emitted length rather than zeroing everything out.
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=["A", "B"])
+        self._setup(monkeypatch, scalars, tan)
+        out = query_lmstudio(None, "http://x", "page", [])
+        assert [t.title for t in out.tracks] == ["A", "B"]
+
+    def test_notes_from_both_passes_merge(self, monkeypatch):
+        scalars = AlbumScalars(album="A", notes="album title not visible")
+        tan = TrackTitlesAndNotes(
+            track_titles=["T"],
+            notes="track 5 duration off by 8s",
+        )
+        self._setup(monkeypatch, scalars, tan)
+        out = query_lmstudio(None, "http://x", "page", [])
+        assert out.notes == "album title not visible\ntrack 5 duration off by 8s"
+
+    def test_notes_none_when_both_passes_silent(self, monkeypatch):
+        scalars = AlbumScalars()
+        tan = TrackTitlesAndNotes(track_titles=[])
+        self._setup(monkeypatch, scalars, tan)
+        out = query_lmstudio(None, "http://x", "page", [])
+        assert out.notes is None
+
+    def test_notes_only_from_one_pass(self, monkeypatch):
+        scalars = AlbumScalars(notes="only scalar notes")
+        tan = TrackTitlesAndNotes(track_titles=[])
+        self._setup(monkeypatch, scalars, tan)
+        out = query_lmstudio(None, "http://x", "page", [])
+        assert out.notes == "only scalar notes"
 
 
 # ---------- build_image_chat_text ----------
@@ -349,6 +480,8 @@ class TestBuildImageChatText:
         assert "from the image" in intro.lower()
         assert "alignment" in intro.lower()
         assert "2 ripped track(s)" in intro
+        # Singular phrasing when only one image.
+        assert "Below is an image" in intro
         # Alignment carries the actual file list AFTER the image.
         assert "01.flac" in alignment
         assert "02.flac" in alignment
@@ -356,27 +489,40 @@ class TestBuildImageChatText:
         assert "Source URL" not in intro and "Source URL" not in alignment
         assert "PAGE TEXT" not in intro and "PAGE TEXT" not in alignment
 
+    def test_plural_phrasing_for_multiple_images(self):
+        tracks = [
+            {"position": 1, "filename": "01.flac", "duration_seconds": 30.5},
+        ]
+        intro, alignment = build_image_chat_text(tracks, num_images=3)
+        # Intro signals multiple images and combining-views guidance.
+        assert "3 images" in intro
+        assert "across the images" in intro
+        assert "any image" in intro
+        # Alignment text references the multi-image read.
+        assert "from the images" in alignment
+
 
 # ---------- query_lmstudio_image ----------
 
 class TestQueryLmstudioImage:
     @staticmethod
-    def _setup(monkeypatch, parsed):
+    def _setup(monkeypatch, parsed, num_handles=1):
         fake_lms = MagicMock()
         client = fake_lms.Client.return_value.__enter__.return_value
         fake_lms.Client.return_value.__exit__.return_value = False
-        client.prepare_image.return_value = MagicMock(name="FileHandle")
+        handles = [MagicMock(name=f"FileHandle{i}") for i in range(num_handles)]
+        client.prepare_image.side_effect = handles
         model = client.llm.model.return_value
         model.respond.return_value.parsed = parsed
         monkeypatch.setattr(cdm, "lms", fake_lms)
-        return fake_lms, client, model
+        return fake_lms, client, model, handles
 
     def test_passes_image_handle_to_chat(self, tmp_path, monkeypatch):
         img = tmp_path / "back.jpg"
         img.write_bytes(b"")
         meta = make_meta()
-        fake_lms, client, _ = self._setup(monkeypatch, meta)
-        out = query_lmstudio_image("my-model", img, [])
+        fake_lms, client, _, handles = self._setup(monkeypatch, meta)
+        out = query_lmstudio_image("my-model", [img], [])
         assert isinstance(out, AlbumMetadata)
         client.prepare_image.assert_called_once_with(img)
         client.llm.model.assert_called_once_with("my-model")
@@ -387,16 +533,37 @@ class TestQueryLmstudioImage:
         content = args[0]
         assert isinstance(content, list) and len(content) == 3
         assert isinstance(content[0], str)
-        assert content[1] is client.prepare_image.return_value
+        assert content[1] is handles[0]
         assert isinstance(content[2], str)
         # And the chat is built from the image-specific system prompt.
         fake_lms.Chat.assert_called_once_with(cdm.IMAGE_SYSTEM_PROMPT)
 
+    def test_multiple_images_attached_in_order(self, tmp_path, monkeypatch):
+        a = tmp_path / "back.jpg"
+        b = tmp_path / "insert.jpg"
+        a.write_bytes(b"")
+        b.write_bytes(b"")
+        fake_lms, client, _, handles = self._setup(
+            monkeypatch, make_meta(), num_handles=2,
+        )
+        query_lmstudio_image("my-model", [a, b], [])
+        # Both images prepared, in argument order.
+        assert [c.args[0] for c in client.prepare_image.call_args_list] == [a, b]
+        chat = fake_lms.Chat.return_value
+        args, _ = chat.add_user_message.call_args
+        content = args[0]
+        # Content is [intro, handle_a, handle_b, alignment].
+        assert len(content) == 4
+        assert isinstance(content[0], str)
+        assert content[1] is handles[0]
+        assert content[2] is handles[1]
+        assert isinstance(content[3], str)
+
     def test_without_model_name(self, tmp_path, monkeypatch):
         img = tmp_path / "back.png"
         img.write_bytes(b"")
-        _, client, _ = self._setup(monkeypatch, make_meta())
-        query_lmstudio_image(None, img, [])
+        _, client, _, _ = self._setup(monkeypatch, make_meta())
+        query_lmstudio_image(None, [img], [])
         client.llm.model.assert_called_once_with()
 
     def test_dict_parsed_uses_model_validate(self, tmp_path, monkeypatch):
@@ -408,7 +575,7 @@ class TestQueryLmstudioImage:
             "tracks": [{"track_number": 1, "title": "T (song)"}],
         }
         self._setup(monkeypatch, parsed_dict)
-        out = query_lmstudio_image(None, img, [])
+        out = query_lmstudio_image(None, [img], [])
         assert out.album == "A"
         assert out.tracks[0].title == "T"
 
@@ -820,6 +987,90 @@ def test_main_summary_emits_notes_when_present(tmp_path, monkeypatch, capsys):
     assert "  Track 5 duration off by 8s." in err
 
 
+# ---------- log_summary status line ----------
+
+class TestSummaryStatus:
+    """Status reflects whether the extraction is ready for --write/--rename.
+
+    The check mirrors the guards in write_tags/rename_release: album,
+    album_artist, and every track title must be non-null. Anything else
+    (date, label, genre, catalog_number) is informational only.
+    """
+
+    def _run(self, monkeypatch, capsys, meta, tmp_path):
+        audio = tmp_path / "rips"
+        audio.mkdir()
+        monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+        monkeypatch.setattr(cdm, "fetch_page_text", lambda url: "PAGE")
+        monkeypatch.setattr(cdm, "query_lmstudio", lambda *a, **k: meta)
+        monkeypatch.setattr(sys, "argv", [
+            "cd_metadata.py", "--url", "http://x", "--dir", str(audio),
+        ])
+        main()
+        return capsys.readouterr().err
+
+    def test_complete_when_all_required_fields_populated(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        meta = make_meta()  # 2 tracks, both titled
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Status:       complete — ready to --write/--rename" in err
+        assert "Tracks:       2 (all titled)" in err
+
+    def test_needs_review_when_album_null(self, tmp_path, monkeypatch, capsys):
+        meta = make_meta(album=None)
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Status:       needs review — missing album" in err
+
+    def test_needs_review_when_artist_null(self, tmp_path, monkeypatch, capsys):
+        meta = make_meta(album_artist=None)
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Status:       needs review — missing album_artist" in err
+
+    def test_singular_track_title_missing(self, tmp_path, monkeypatch, capsys):
+        meta = make_meta(tracks=[
+            Track(track_number=1, title="A"),
+            Track(track_number=2, title=None),
+        ])
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Tracks:       2 (1 titled, 1 missing)" in err
+        assert "missing 1 track title" in err
+        # Singular: not "1 track titles".
+        assert "1 track titles" not in err
+
+    def test_plural_track_titles_missing(self, tmp_path, monkeypatch, capsys):
+        meta = make_meta(tracks=[
+            Track(track_number=1, title=None),
+            Track(track_number=2, title=None),
+            Track(track_number=3, title="C"),
+        ])
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Tracks:       3 (1 titled, 2 missing)" in err
+        assert "missing 2 track titles" in err
+
+    def test_multiple_missing_fields_listed_in_order(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        meta = make_meta(
+            album=None,
+            album_artist=None,
+            tracks=[Track(track_number=1, title=None)],
+        )
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert (
+            "Status:       needs review — missing album, album_artist, 1 track title"
+            in err
+        )
+
+    def test_zero_tracks_renders_as_zero(self, tmp_path, monkeypatch, capsys):
+        meta = make_meta(tracks=[])
+        err = self._run(monkeypatch, capsys, meta, tmp_path)
+        assert "Tracks:       0" in err
+        # Zero tracks with album/album_artist populated is "complete" —
+        # there are no track titles to be missing.
+        assert "Status:       complete" in err
+
+
 def test_main_full_flow(tmp_path, monkeypatch, capsys):
     audio = tmp_path / "rips"
     audio.mkdir()
@@ -1015,6 +1266,19 @@ def test_main_url_and_metadata_mutually_exclusive(tmp_path, monkeypatch, capsys)
 
 # ---------- --image mode ----------
 
+def _fake_sips_run(cmd, **kwargs):
+    """Fake subprocess.run for sips. Handles two call patterns:
+
+    - dimensions query (`sips -g pixelWidth -g pixelHeight PATH`) → small dims
+    - conversion (`sips ... --out PATH`) → write a stub JPEG to that path
+    """
+    if "-g" in cmd:
+        return MagicMock(returncode=0, stdout=_sips_dims(800, 600), stderr="")
+    out_path = Path(cmd[cmd.index("--out") + 1])
+    out_path.write_bytes(b"FAKE JPEG")
+    return MagicMock(returncode=0, stderr="", stdout="")
+
+
 def test_main_image_skips_url_path(tmp_path, monkeypatch):
     audio = tmp_path / "rips"
     audio.mkdir()
@@ -1026,18 +1290,49 @@ def test_main_image_skips_url_path(tmp_path, monkeypatch):
     monkeypatch.setattr(cdm, "fetch_page_text", boom)
     monkeypatch.setattr(cdm, "query_lmstudio", boom)
     monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    monkeypatch.setattr(cdm.subprocess, "run", _fake_sips_run)
     captured: list = []
     monkeypatch.setattr(
         cdm, "query_lmstudio_image",
-        lambda model, path, tracks: captured.append((model, path, tracks)) or make_meta(),
+        lambda model, paths, tracks: captured.append((model, paths, tracks)) or make_meta(),
     )
 
     monkeypatch.setattr(sys, "argv", [
         "cd_metadata.py", "--image", str(img), "--dir", str(audio),
     ])
     main()
-    assert captured and captured[0][1] == img
+    # query_lmstudio_image now receives a list of normalized JPEG temp paths.
+    assert captured and len(captured[0][1]) == 1
+    assert captured[0][1][0].suffix == ".jpg"
     assert (audio / "metadata.json").exists()
+
+
+def test_main_image_multiple_inputs(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="cd_metadata")
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    a = tmp_path / "back.jpg"
+    b = tmp_path / "insert.png"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+    monkeypatch.setattr(cdm.subprocess, "run", _fake_sips_run)
+    monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
+    seen: list = []
+    monkeypatch.setattr(
+        cdm, "query_lmstudio_image",
+        lambda model, paths, tracks: seen.append(paths) or make_meta(),
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py", "--image", str(a), str(b), "--dir", str(audio),
+    ])
+    main()
+    assert seen and len(seen[0]) == 2
+    # Each input was normalized to its own JPEG temp file.
+    assert {p.suffix for p in seen[0]} == {".jpg"}
+    assert seen[0][0] != seen[0][1]
+    # Per-image log lines.
+    assert caplog.text.count("Normalized") == 2
+    assert "Sending 2 image(s)" in caplog.text
 
 
 def test_main_image_not_a_file_exits(tmp_path, monkeypatch):
@@ -1068,19 +1363,87 @@ def test_main_image_unsupported_format_exits(tmp_path, monkeypatch):
     assert ".tiff" in msg
 
 
-# ---------- _resolve_image (HEIC conversion) ----------
+def test_main_image_unsupported_format_among_multiple_exits(tmp_path, monkeypatch):
+    audio = tmp_path / "rips"
+    audio.mkdir()
+    good = tmp_path / "back.jpg"
+    bad = tmp_path / "insert.tiff"
+    good.write_bytes(b"")
+    bad.write_bytes(b"")
+    monkeypatch.setattr(sys, "argv", [
+        "cd_metadata.py",
+        "--image", str(good), str(bad),
+        "--dir", str(audio),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert ".tiff" in str(exc.value)
+
+
+# ---------- _resolve_image (sips normalization) ----------
+
+
+def _sips_dims(width: int, height: int):
+    """Build a fake sips -g output string for the given dimensions.
+
+    Mirrors the real sips output: an unindented path line followed by
+    indented `key: value` lines. Covering the path-line branch matters
+    because cd_metadata's parser must skip non-matching keys.
+    """
+    return f"/tmp/fake.jpg\n  pixelWidth: {width}\n  pixelHeight: {height}\n"
+
 
 class TestResolveImage:
-    def test_passthrough_for_non_heic(self, tmp_path, monkeypatch):
+    def test_normalizes_small_jpeg_without_resize(self, tmp_path, monkeypatch):
+        """Small images skip the -Z flag (sips -Z would otherwise upscale)."""
         jpg = tmp_path / "back.jpg"
         jpg.write_bytes(b"data")
-        called: list = []
-        monkeypatch.setattr(
-            cdm.subprocess, "run", lambda *a, **k: called.append(1),
-        )
+        captured: list = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0, stdout=_sips_dims(800, 600), stderr="",
+                )
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"NORMALIZED")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
         with cdm._resolve_image(jpg) as resolved:
-            assert resolved is jpg
-        assert called == []
+            assert resolved.suffix == ".jpg"
+            assert resolved != jpg  # temp file, not the original
+            assert resolved.read_bytes() == b"NORMALIZED"
+        assert not resolved.exists()
+        # Conversion call carries the format flag but NOT -Z (image fits).
+        convert_cmd = captured[-1]
+        assert convert_cmd[:4] == ["sips", "-s", "format", "jpeg"]
+        assert "-Z" not in convert_cmd
+        assert str(jpg) in convert_cmd
+
+    def test_resizes_oversized_jpeg(self, tmp_path, monkeypatch):
+        """Images exceeding IMAGE_MAX_DIMENSION get the -Z cap."""
+        jpg = tmp_path / "big.jpg"
+        jpg.write_bytes(b"")
+        captured: list = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0, stdout=_sips_dims(4032, 3024), stderr="",
+                )
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"RESIZED")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with cdm._resolve_image(jpg) as resolved:
+            assert resolved.read_bytes() == b"RESIZED"
+        convert_cmd = captured[-1]
+        assert "-Z" in convert_cmd
+        assert convert_cmd[convert_cmd.index("-Z") + 1] == str(cdm.IMAGE_MAX_DIMENSION)
 
     def test_converts_heic_via_sips(self, tmp_path, monkeypatch):
         heic = tmp_path / "back.heic"
@@ -1089,6 +1452,10 @@ class TestResolveImage:
 
         def fake_run(cmd, **kwargs):
             captured.append(cmd)
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0, stdout=_sips_dims(1024, 768), stderr="",
+                )
             out_path = Path(cmd[cmd.index("--out") + 1])
             out_path.write_bytes(b"FAKE JPEG")
             return MagicMock(returncode=0, stderr="", stdout="")
@@ -1100,32 +1467,22 @@ class TestResolveImage:
             assert resolved.exists()
         # Cleanup after exit
         assert not resolved.exists()
-        # sips called with the expected args
-        assert captured[0][:5] == ["sips", "-s", "format", "jpeg", str(heic)]
+        # Format conversion happens on the second sips call.
+        convert_cmd = captured[-1]
+        assert convert_cmd[:4] == ["sips", "-s", "format", "jpeg"]
+        assert str(heic) in convert_cmd
 
     def test_converts_heif_too(self, tmp_path, monkeypatch):
         heif = tmp_path / "back.heif"
         heif.write_bytes(b"")
-
-        def fake_run(cmd, **kwargs):
-            out_path = Path(cmd[cmd.index("--out") + 1])
-            out_path.write_bytes(b"data")
-            return MagicMock(returncode=0, stderr="", stdout="")
-
-        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        monkeypatch.setattr(cdm.subprocess, "run", _fake_sips_run)
         with cdm._resolve_image(heif) as resolved:
             assert resolved.suffix == ".jpg"
 
     def test_cleans_up_on_exception(self, tmp_path, monkeypatch):
         heic = tmp_path / "back.heic"
         heic.write_bytes(b"")
-
-        def fake_run(cmd, **kwargs):
-            out_path = Path(cmd[cmd.index("--out") + 1])
-            out_path.write_bytes(b"data")
-            return MagicMock(returncode=0, stderr="", stdout="")
-
-        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        monkeypatch.setattr(cdm.subprocess, "run", _fake_sips_run)
         captured: list = []
         with pytest.raises(RuntimeError):
             with cdm._resolve_image(heic) as resolved:
@@ -1149,10 +1506,15 @@ class TestResolveImage:
     def test_sips_failure_exits(self, tmp_path, monkeypatch):
         heic = tmp_path / "back.heic"
         heic.write_bytes(b"")
-        monkeypatch.setattr(
-            cdm.subprocess, "run",
-            lambda *a, **k: MagicMock(returncode=1, stderr="bad input", stdout=""),
-        )
+
+        def fake_run(cmd, **kwargs):
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0, stdout=_sips_dims(800, 600), stderr="",
+                )
+            return MagicMock(returncode=1, stderr="bad input", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
         with pytest.raises(SystemExit) as exc:
             with cdm._resolve_image(heic):
                 pass
@@ -1163,14 +1525,63 @@ class TestResolveImage:
         """Cover the '(no message)' fallback when sips emits no stderr/stdout."""
         heic = tmp_path / "back.heic"
         heic.write_bytes(b"")
-        monkeypatch.setattr(
-            cdm.subprocess, "run",
-            lambda *a, **k: MagicMock(returncode=1, stderr="", stdout=""),
-        )
+
+        def fake_run(cmd, **kwargs):
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0, stdout=_sips_dims(800, 600), stderr="",
+                )
+            return MagicMock(returncode=1, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
         with pytest.raises(SystemExit) as exc:
             with cdm._resolve_image(heic):
                 pass
         assert "(no message)" in str(exc.value)
+
+    def test_dim_query_failure_still_resizes(self, tmp_path, monkeypatch):
+        """If sips -g fails, fall back to including -Z so the convert call
+        surfaces the real error (don't silently skip the cap)."""
+        jpg = tmp_path / "back.jpg"
+        jpg.write_bytes(b"")
+        captured: list = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            if "-g" in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="bad header")
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"X")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with cdm._resolve_image(jpg):
+            pass
+        # -Z is included because the dim query failed.
+        assert "-Z" in captured[-1]
+
+    def test_dim_query_non_numeric_treated_as_oversized(self, tmp_path, monkeypatch):
+        """Garbage pixel-dimension output → safer to include -Z than skip it."""
+        jpg = tmp_path / "back.jpg"
+        jpg.write_bytes(b"")
+        captured: list = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            if "-g" in cmd:
+                return MagicMock(
+                    returncode=0,
+                    stdout="  pixelWidth: not-a-number\n  pixelHeight: 600\n",
+                    stderr="",
+                )
+            out_path = Path(cmd[cmd.index("--out") + 1])
+            out_path.write_bytes(b"X")
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+        with cdm._resolve_image(jpg):
+            pass
+        assert "-Z" in captured[-1]
 
 
 def test_main_image_heic_runs_sips_and_passes_jpg(tmp_path, monkeypatch, caplog):
@@ -1180,26 +1591,22 @@ def test_main_image_heic_runs_sips_and_passes_jpg(tmp_path, monkeypatch, caplog)
     heic = tmp_path / "back.heic"
     heic.write_bytes(b"")
 
-    def fake_run(cmd, **kwargs):
-        out_path = Path(cmd[cmd.index("--out") + 1])
-        out_path.write_bytes(b"FAKE JPEG")
-        return MagicMock(returncode=0, stderr="", stdout="")
-
-    monkeypatch.setattr(cdm.subprocess, "run", fake_run)
+    monkeypatch.setattr(cdm.subprocess, "run", _fake_sips_run)
     monkeypatch.setattr(cdm, "load_local_tracks", lambda d: [])
     seen: list = []
     monkeypatch.setattr(
         cdm, "query_lmstudio_image",
-        lambda model, path, tracks: seen.append(path) or make_meta(),
+        lambda model, paths, tracks: seen.append(paths) or make_meta(),
     )
 
     monkeypatch.setattr(sys, "argv", [
         "cd_metadata.py", "--image", str(heic), "--dir", str(audio),
     ])
     main()
-    assert seen and seen[0].suffix == ".jpg"
-    assert seen[0] != heic  # converted path, not the original
-    assert "Converted" in caplog.text and "sips" in caplog.text
+    assert seen and len(seen[0]) == 1
+    assert seen[0][0].suffix == ".jpg"
+    assert seen[0][0] != heic  # normalized temp path, not the original
+    assert "Normalized" in caplog.text and "sips" in caplog.text
 
 
 def test_main_url_and_image_mutually_exclusive(tmp_path, monkeypatch, capsys):
